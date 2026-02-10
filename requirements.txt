@@ -1,0 +1,6 @@
+langchain
+langchain-openai
+pandas
+sqlite3
+streamlit
+python-dotenv
