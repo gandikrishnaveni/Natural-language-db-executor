@@ -1,5 +1,13 @@
-langchain
-langchain-openai
-pandas
-streamlit
+# NLP and LLM
+langchain-ollama
 python-dotenv
+
+# Data Handling and Execution
+pandas
+sqlite3
+
+# Frontend (for Vasavi)
+streamlit
+
+# Utilities
+sqlparse
