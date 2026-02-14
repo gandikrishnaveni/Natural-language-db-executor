@@ -20,7 +20,7 @@ st.set_page_config(
 EMPLOYEES = {
     "E001": {"name": "Aarav Sharma", "role": "Admin"},
     "E002": {"name": "Meera Nair", "role": "Manager"},
-    "E003": {"name": "Rahul Verma", "role": "Staff"},
+    "E003": {"name": "Rahul Verma", "role": "Employee"},
 }
 
 # -------------------- SESSION STATE --------------------
@@ -188,15 +188,43 @@ if st.session_state.logged_in:
                 cursor = conn.cursor()
 
                 try:
-                    cursor.execute(generated_sql)
+                    conn = sqlite3.connect(st.session_state.db_path)
 
-                    if generated_sql.lower().startswith("select"):
+                    sql_lower = generated_sql.strip().lower()
+
+                    # SELECT queries
+                    if sql_lower.startswith("select"):
                         df = pd.read_sql_query(generated_sql, conn)
                         affected_rows = len(df)
+
+                        st.markdown(f"""
+                        <div class="success-box">
+                        ✅ {affected_rows} rows returned
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        st.subheader("📊 Result")
+                        st.dataframe(df, use_container_width=True)
+
+                    # NON-SELECT queries
                     else:
+                        cursor = conn.cursor()
+                        cursor.execute(generated_sql)
                         conn.commit()
                         affected_rows = cursor.rowcount
-                        df = None
+
+                        st.markdown(f"""
+                        <div class="success-box">
+                        ✅ {affected_rows} rows affected
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    conn.close()
+
+                except Exception as e:
+                    st.error(f"Execution Error: {e}")
+
+
 
                     # -------- REAL AUDIT LOGGING (CORRECT PLACE) --------
                     action_type = "SELECT"
@@ -228,7 +256,7 @@ if st.session_state.logged_in:
 
                     if df is not None:
                         st.subheader("📊 Affected Dataset")
-                        st.dataframe(df, width="stretch")
+                        st.dataframe(history_df, use_container_width=True)
 
                 except Exception as e:
                     st.error(f"Execution Error: {e}")
@@ -274,7 +302,8 @@ if st.session_state.logged_in:
             conn.close()
 
             if not history_df.empty:
-                st.dataframe(history_df, width="stretch")
+                st.dataframe(history_df, use_container_width=True)
+
             else:
                 st.info("No logs yet.")
 
