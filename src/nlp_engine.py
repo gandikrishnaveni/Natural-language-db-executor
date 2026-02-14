@@ -104,22 +104,53 @@ DATABASE SCHEMA:
                 
         except Exception as e:
             return f"Execution Error: {str(e)}"
+    def get_clarification(self, user_query):
+        """
+        Checks if the query is vague and returns clarification options or 'CLEAR'.
+        """
+        schema = self.get_database_schema()
+        
+        # This prompt tells Qwen to look at the columns and find potential conflicts
+        clarification_template = """<|im_start|>system
+        You are a database assistant. When you see vague words like "high", "best", or "values", you must look at the SCHEMA and suggest the numeric columns as options.
+        
+        RULE: If ambiguous, you MUST respond in this format: 
+        "AMBIGUOUS: I found multiple ways to measure this. Do you mean based on [Column 1], [Column 2], or [Column 3]?"
+        
+        SCHEMA:
+        {schema}
+        <|im_end|>
+        <|im_start|>user
+        {question}
+        <|im_end|>
+        <|im_start|>assistant
+        """
+        prompt = ChatPromptTemplate.from_template(clarification_template)
+        chain = prompt | self.llm
+        
+        response = chain.invoke({"schema": schema, "question": user_query})
+        return response.content.strip()
 
 # --- QUICK TEST BLOCK ---
 if __name__ == "__main__":
-    # Ensure this path is correct for your local setup
     db_file = "data/college_2.sqlite" 
     engine = NLPEngine(db_file)
     
-    print("--- QWEN ENGINE TEST ---")
-    test_query = "List all students"
+    print("--- ⚖️ LegalBrain AI Interactive Demo ---")
+    query = input("Ask me something: ") # Try "Who are the top students?"
     
-    # 1. Generate the SQL
-    generated_sql = engine.generate_sql(test_query)
-    print(f"Question: {test_query}")
-    print(f"Generated SQL: {generated_sql}")
+    # STEP 1: Check for Ambiguity
+    status = engine.get_clarification(query)
     
-    # 2. Execute the SQL and print results
-    print("\n--- EXECUTION TEST ---")
-    result = engine.execute_query(generated_sql)
+    if "AMBIGUOUS" in status:
+        print(f"\n🤔 {status}")
+        # Let the user clarify
+        query = input("Please clarify your request: ")
+        
+    # STEP 2: Generate and Execute
+    sql = engine.generate_sql(query)
+    print(f"\n🚀 Running SQL: {sql}")
+    
+    result = engine.execute_query(sql)
+    print("\n--- RESULTS ---")
     print(result)
