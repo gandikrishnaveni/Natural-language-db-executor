@@ -11,27 +11,17 @@ load_dotenv()
 
 class NLPEngine:
     def __init__(self, db_path):
-        """
-        Initializes the NLP Engine with the efficient Qwen2.5-Coder-1.5B model.
-        This model provides sub-second latency for SQL generation on most laptops.
-        """
         self.db_path = db_path
-        
-        # Initialize the local LLM via Ollama
         self.llm = ChatOllama(
             model="qwen2.5-coder:1.5b",
-            temperature=0,  # Zero temperature for deterministic/accurate SQL
+            temperature=0,  
             base_url="http://localhost:11434"
         )
 
     def get_database_schema(self):
-        """
-        Extracts the schema from SQLite to provide context for the model.
-        """
+        """Extracts schema. If file doesn't exist yet, returns empty for new DB scenarios."""
         try:
-            if not os.path.exists(self.db_path):
-                return "Error: Database file not found."
-            
+            if not os.path.exists(self.db_path): return ""
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT sql FROM sqlite_master WHERE type='table';")
@@ -41,18 +31,20 @@ class NLPEngine:
         except Exception as e:
             return f"Error reading schema: {str(e)}"
 
-    def generate_sql(self, user_query):
+    def get_clarification(self, user_query):
         """
-        Translates Natural Language to SQL using Qwen2.5-Coder.
+        Universal Ambiguity Check: 
+        Triggers if subjective terms are used without a column.
         """
         schema = self.get_database_schema()
+        
+        clarification_template = """<|im_start|>system
+You are a SQL Architect. Analyze the user query against the SCHEMA.
+1. If 'high', 'best', 'top', or 'values' is used and multiple numeric columns exist, respond AMBIGUOUS.
+2. If the query clearly maps to a column or is a CREATE/INSERT action, respond CLEAR.
+3. If 'values' is used without a column name, it is ALWAYS AMBIGUOUS.
 
-        # Custom Prompt for Qwen Coder efficiency
-        system_template = """<|im_start|>system
-You are a SQL expert. Use the provided database schema to write a valid SQLite query.
-Output ONLY the SQL code. No explanation. No markdown backticks.
-
-DATABASE SCHEMA:
+SCHEMA:
 {schema}
 <|im_end|>
 <|im_start|>user
@@ -60,97 +52,94 @@ DATABASE SCHEMA:
 <|im_end|>
 <|im_start|>assistant
 """
-        
+        prompt = ChatPromptTemplate.from_template(clarification_template)
+        chain = prompt | self.llm
+        return chain.invoke({"schema": schema, "question": user_query}).content.strip()
+
+    def generate_sql(self, user_query):
+        """
+        Generalized SQL Generator with Intent Logic and Syntax Guards.
+        """
+        schema = self.get_database_schema()
+
+        system_template = """<|im_start|>system
+You are an expert SQLite Translator. Logic rules:
+1. INTENT: "Show/List/Who" -> SELECT. "Total/Sum" -> SUM(). "How many" -> COUNT().
+2. SORTING: If "top/best/high", use ORDER BY [col] DESC LIMIT [N].
+3. SQLITE RULES: NEVER use 'CREATE DATABASE' or 'USE'. Use 'CREATE TABLE IF NOT EXISTS'.
+4. Output ONLY the SQL code. No markdown. No explanation.
+
+SCHEMA:
+{schema}
+<|im_end|>
+<|im_start|>user
+{question}
+<|im_end|>
+<|im_start|>assistant
+"""
         prompt = ChatPromptTemplate.from_template(system_template)
         chain = prompt | self.llm
         
         try:
-            response = chain.invoke({
-                "schema": schema, 
-                "question": user_query
-            })
-            
-            # Clean output: remove any markdown blocks if the model accidentally includes them
-            sql_output = response.content.strip()
-            sql_output = re.sub(r'```sql|```', '', sql_output).strip()
-            
-            return sql_output
+            response = chain.invoke({"schema": schema, "question": user_query})
+            return re.sub(r'```sql|```', '', response.content.strip()).strip()
         except Exception as e:
             return f"NLP Error: {str(e)}"
 
-    def execute_query(self, sql_query):
-        """
-        Executes the generated SQL on the database and returns the result.
-        """
+    def execute_query(self, sql_query, user_command=None):
+        """Python-side file handling and SQL execution safety."""
         try:
-            # Connect to the SQLite database
+            # 1. HANDLE NEW DATABASE FILE CREATION
+            if user_command and any(word in user_command.lower() for word in ["create database", "new database"]):
+                match = re.search(r'(?:database|named)\s+(\w+)', user_command.lower())
+                if match:
+                    new_db_name = match.group(1)
+                    self.db_path = f"data/{new_db_name}.sqlite"
+                    os.makedirs('data', exist_ok=True)
+                    sqlite3.connect(self.db_path).close()
+                    print(f"📁 Initializing/Switching to: {self.db_path}")
+
+            # 2. SQL SYNTAX GUARD (Removes incompatible MySQL commands)
+            clean_statements = []
+            for stmt in sql_query.split(';'):
+                s = stmt.strip()
+                if not any(bad in s.upper() for bad in ["CREATE DATABASE", "USE "]) and s:
+                    clean_statements.append(s)
+
+            # 3. DB EXECUTION
             conn = sqlite3.connect(self.db_path)
-            
-            # If it's a SELECT query, return a table (DataFrame)
-            if sql_query.strip().upper().startswith("SELECT"):
-                # Use pandas to read the SQL directly into a table format
-                df = pd.read_sql_query(sql_query, conn)
+            # Check if we are doing a SELECT or an Action
+            if clean_statements and clean_statements[0].upper().startswith("SELECT"):
+                df = pd.read_sql_query("; ".join(clean_statements), conn)
                 conn.close()
-                return df
-            
-            # If it's CREATE, INSERT, UPDATE, or DELETE, execute and commit changes
+                return df if not df.empty else "⚠️ No results found."
             else:
                 cursor = conn.cursor()
-                cursor.execute(sql_query)
+                for sql in clean_statements:
+                    cursor.execute(sql)
                 conn.commit()
-                rows_affected = cursor.rowcount
+                res = f"✅ Success! Executed in {self.db_path}"
                 conn.close()
-                return f"Success! {rows_affected} row(s) affected."
-                
+                return res
         except Exception as e:
             return f"Execution Error: {str(e)}"
-    def get_clarification(self, user_query):
-        """
-        Checks if the query is vague and returns clarification options or 'CLEAR'.
-        """
-        schema = self.get_database_schema()
-        
-        # This prompt tells Qwen to look at the columns and find potential conflicts
-        clarification_template = """<|im_start|>system
-        You are a database assistant. When you see vague words like "high", "best", or "values", you must look at the SCHEMA and suggest the numeric columns as options.
-        
-        RULE: If ambiguous, you MUST respond in this format: 
-        "AMBIGUOUS: I found multiple ways to measure this. Do you mean based on [Column 1], [Column 2], or [Column 3]?"
-        
-        SCHEMA:
-        {schema}
-        <|im_end|>
-        <|im_start|>user
-        {question}
-        <|im_end|>
-        <|im_start|>assistant
-        """
-        prompt = ChatPromptTemplate.from_template(clarification_template)
-        chain = prompt | self.llm
-        
-        response = chain.invoke({"schema": schema, "question": user_query})
-        return response.content.strip()
 
-# --- QUICK TEST BLOCK ---
 if __name__ == "__main__":
-    db_file = "data/college_2.sqlite" 
-    engine = NLPEngine(db_file)
-    
-    print("--- ⚖️ LegalBrain AI Interactive Demo ---")
-    query = input("Ask me something: ") # Try "Who are the top students?"
-    
-    # STEP 1: Check for Ambiguity
-    status = engine.get_clarification(query)
-    
-    if "AMBIGUOUS" in status:
-        print(f"\n🤔 {status}")
-        # Let the user clarify
-        query = input("Please clarify your request: ")
+    os.makedirs('data', exist_ok=True)
+    engine = NLPEngine("data/college_2.sqlite")
+    print("--- ⚖️ LegalBrain AI: Final Unified Engine ---")
+    while True:
+        query = input("\n[Enter Command]: ")
+        if query.lower() == 'exit': break
         
-    # STEP 2: Generate and Execute
-    sql = engine.generate_sql(query)
-    print(f"\n🚀 Running SQL: {sql}")
-    
-    result = engine.execute_query(sql)
-    print("\n--- RESULTS ---")
-    print(result)
+        status = engine.get_clarification(query)
+        if "AMBIGUOUS" in status:
+            print(f"🤔 {status}")
+            query = input("Please specify: ")
+            
+        sql = engine.generate_sql(query)
+        print(f"🚀 SQL: {sql}")
+        
+        result = engine.execute_query(sql, user_command=query)
+        print("\n--- RESULTS ---")
+        print(result)

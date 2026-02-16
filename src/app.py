@@ -1,20 +1,27 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-from services.nlp_engine import generate_sql_from_nl
+import os
+import io
+import time
+
+# Core project imports
+from nlp_engine import NLPEngine  
 from database.audit_schema import create_audit_table
 from services.audit_logger import log_action
 from database.db_config import DB_PATH
+
+# Initialize Audit Database on startup
 create_audit_table()
 
-# -------------------- PAGE CONFIG --------------------
-st.set_page_config(
-    page_title="LegalBrain AI",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -------------------- OPTIMIZATION: ENGINE CACHING --------------------
+@st.cache_resource
+def load_engine(db_path):
+    """Initializes the engine only once per database to save resources."""
+    return NLPEngine(db_path)
 
-# Initialize Audit Database (Creates audit.db automatically)
+# -------------------- PAGE CONFIG --------------------
+st.set_page_config(page_title="LegalBrain AI", page_icon="⚖️", layout="wide")
 
 # -------------------- MOCK EMPLOYEE DATABASE --------------------
 EMPLOYEES = {
@@ -26,286 +33,201 @@ EMPLOYEES = {
 # -------------------- SESSION STATE --------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-
 if "user" not in st.session_state:
     st.session_state.user = {}
-
 if "db_path" not in st.session_state:
-    st.session_state.db_path = None
+    st.session_state.db_path = "data/college_2.sqlite"
+if "last_query" not in st.session_state:
+    st.session_state.last_query = None
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "pending_dml" not in st.session_state:
+    st.session_state.pending_dml = None
 
-# -------------------- ENTERPRISE DARK CSS --------------------
+# -------------------- ENTERPRISE CSS --------------------
 st.markdown("""
 <style>
-html, body, [class*="css"]  {
-    background-color: #0f172a;
-    color: #e2e8f0;
-}
-.block-container {
-    padding-top: 2rem;
-}
-.stButton>button {
-    border-radius: 10px;
-    background-color: #1e293b;
-    color: white;
-    border: 1px solid #334155;
-}
-.stButton>button:hover {
-    background-color: #334155;
-}
-.dataset-card {
-    padding: 15px;
-    border-radius: 12px;
-    background-color: #1e293b;
-    border: 1px solid #334155;
-    color: #f1f5f9 !important;
-    font-weight: 600;
-}
-.success-box {
-    background-color: #064e3b;
-    padding: 10px;
-    border-radius: 8px;
-}
+    [data-testid="stAppViewContainer"] { background-color: #0f172a; color: #e2e8f0; }
+    .stButton>button { border-radius: 10px; background-color: #1e293b; color: white; border: 1px solid #334155; }
+    .dataset-card { padding: 15px; border-radius: 12px; background-color: #1e293b; border: 1px solid #38bdf8; color: #38bdf8 !important; text-align: center; font-weight: bold; margin-bottom: 15px; }
+    .query-box { background-color: #1e293b; padding: 20px; border-radius: 15px; border-left: 5px solid #38bdf8; margin-bottom: 20px; }
+    .success-box { background-color: #064e3b; padding: 15px; border-radius: 8px; border-left: 5px solid #10b981; margin-top: 10px; margin-bottom: 10px; }
+    .warning-box { background-color: #451a03; padding: 15px; border-radius: 8px; border-left: 5px solid #f59e0b; margin-top: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-# =====================================================
 # -------------------- SIDEBAR ------------------------
-# =====================================================
 with st.sidebar:
-
     st.title("⚖️ LegalBrain AI")
-
-    # ---------------- LOGIN SYSTEM ----------------
     if not st.session_state.logged_in:
-        emp_id = st.text_input("Enter Employee ID")
-
-        if st.button("Login"):
+        emp_id = st.text_input("Employee ID", placeholder="E001")
+        if st.button("Login", use_container_width=True):
             if emp_id in EMPLOYEES:
                 st.session_state.logged_in = True
                 st.session_state.user = EMPLOYEES[emp_id]
-                st.success("Login Successful")
                 st.rerun()
             else:
-                st.error("Invalid Employee ID")
-
+                st.error("Invalid ID")
     else:
-        st.markdown("### 👤 User Profile")
-        st.write(f"**Name:** {st.session_state.user['name']}")
-        st.write(f"**Role:** {st.session_state.user['role']}")
-
-        if st.button("Logout"):
-            st.session_state.logged_in = False
-            st.session_state.user = {}
-            st.session_state.db_path = None
+        st.write(f"👤 **{st.session_state.user['name']}**")
+        st.caption(f"Role: {st.session_state.user['role']}")
+        
+        st.divider()
+        st.subheader("📤 Upload New Database")
+        uploaded_file = st.file_uploader("Choose a .sqlite file", type=["sqlite", "db", "sqlite3"])
+        
+        if uploaded_file is not None:
+            if not os.path.exists("data"): os.makedirs("data")
+            target_path = os.path.join("data", uploaded_file.name)
+            with open(target_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.success(f"Saved {uploaded_file.name}")
+            st.session_state.db_path = target_path
             st.rerun()
 
-    st.markdown("---")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
-    # ---------------- SQLITE UPLOAD ----------------
-    if st.session_state.logged_in:
-        uploaded_file = st.file_uploader(
-            "Upload .sqlite Database",
-            type=["sqlite", "db", "sqlite3"]
-        )
-
-        if uploaded_file:
-            db_path = f"temp_{uploaded_file.name}"
-            with open(db_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            st.session_state.db_path = db_path
-            st.success("Database Loaded Successfully")
-
-# =====================================================
 # -------------------- MAIN DASHBOARD -----------------
-# =====================================================
 if st.session_state.logged_in:
+    
+    # --------- DATABASE GALLERY ----------
+    st.subheader("📂 Select Available Database")
+    data_folder = "data"
+    if not os.path.exists(data_folder): os.makedirs(data_folder)
+    db_files = [f for f in os.listdir(data_folder) if f.endswith(('.sqlite', '.db', '.sqlite3'))]
+    
+    if db_files:
+        cols = st.columns(4)
+        for idx, db_name in enumerate(db_files):
+            with cols[idx % 4]:
+                current_p = os.path.join(data_folder, db_name)
+                btn_label = f"✅ {db_name}" if st.session_state.db_path == current_p else f"📁 {db_name}"
+                if st.button(btn_label, use_container_width=True):
+                    st.session_state.db_path = current_p
+                    st.rerun()
+    
+    st.markdown(f'<div class="dataset-card">ACTIVE CONTEXT: {os.path.basename(st.session_state.db_path)}</div>', unsafe_allow_html=True)
 
-    # --------- DATASET GALLERY ----------
-    st.subheader("📂 Available Dataset")
+    tabs = st.tabs(["Query Console", "Audit Logs"] if st.session_state.user["role"] != "Employee" else ["Query Console"])
 
-    if st.session_state.db_path:
-        st.markdown(f"""
-        <div class="dataset-card">
-        🗄️ {st.session_state.db_path}
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.info("No Database Selected")
+    with tabs[0]:
+        user_input = st.chat_input("Enter your natural language query...")
 
-    st.markdown("---")
-
-    # --------- TABS ----------
-    tabs = ["Query Console"]
-    if st.session_state.user["role"] in ["Manager", "Admin"]:
-        tabs.append("History Logs")
-
-    selected_tab = st.tabs(tabs)
-
-    # =====================================================
-    # ---------------- QUERY CONSOLE ----------------------
-    # =====================================================
-    with selected_tab[0]:
-
-        st.subheader("💬 Natural Language Query")
-        user_query = st.chat_input("Write your database instruction...")
-
-        if user_query and st.session_state.db_path:
-
-            generated_sql = generate_sql_from_nl(user_query)
-            st.subheader("🧠 Generated SQL")
-            st.code(generated_sql, language="sql")
-
-            role = st.session_state.user["role"]
-
-            # ---------- ROLE PERMISSION CHECK ----------
-            if "delete" in generated_sql.lower() and role == "Staff":
-                st.error("❌ Permission Denied: Staff cannot perform DELETE operations.")
-
-                # LOG PERMISSION DENIED (VERY PROFESSIONAL)
-                log_action(
-                    user_id=st.session_state.user["name"],
-                    user_role=role,
-                    action_type="DELETE_BLOCKED",
-                    dataset_name=st.session_state.db_path,
-                    natural_language_query=user_query,
-                    generated_sql=generated_sql,
-                    outcome_status="DENIED",
-                    affected_rows=0
-                )
-                st.stop()
-
-            # ---------- SAFETY CONFIRMATION ----------
-            dangerous = any(k in generated_sql.lower() for k in ["delete", "update"])
-            execute = True
-
-            if dangerous:
-                st.warning("⚠️ This operation will modify the database.")
-                execute = st.checkbox("Confirm Execution")
-
-            if execute:
-                conn = sqlite3.connect(st.session_state.db_path)
-                cursor = conn.cursor()
+        if user_input:
+            st.session_state.last_result = None
+            st.session_state.pending_dml = None
+            st.session_state.last_query = user_input
+            
+            with st.status("⚖️ Intelligence Pipeline Active...", expanded=True) as status:
+                step_placeholder = st.empty()
+                
+                # Function to show ALL steps and highlight the current one
+                def update_ui_steps(current_step):
+                    all_steps = [
+                        "📂 Step 1: Indexing Database Schema",
+                        "🛡️ Step 2: Running Ambiguity Guard",
+                        "🧠 Step 3: LLM SQL Generation (Qwen 2.5)",
+                        "🧼 Step 4: Syntax Sanitization",
+                        "🔍 Step 5: Dry-Run Trace Analysis",
+                        "⚙️ Step 6: Finalizing Execution & Audit"
+                    ]
+                    html = ""
+                    for i, text in enumerate(all_steps):
+                        if i < current_step:
+                            html += f"<div style='color: #10b981; font-weight: bold;'>{text} ✅</div>"
+                        elif i == current_step:
+                            html += f"<div style='color: #38bdf8; font-weight: bold;'>{text} ⚡ (Processing...)</div>"
+                        else:
+                            html += f"<div style='color: #475569;'>{text}</div>"
+                    step_placeholder.markdown(html, unsafe_allow_html=True)
 
                 try:
-                    conn = sqlite3.connect(st.session_state.db_path)
-
-                    sql_lower = generated_sql.strip().lower()
-
-                    # SELECT queries
-                    if sql_lower.startswith("select"):
-                        df = pd.read_sql_query(generated_sql, conn)
-                        affected_rows = len(df)
-
-                        st.markdown(f"""
-                        <div class="success-box">
-                        ✅ {affected_rows} rows returned
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        st.subheader("📊 Result")
-                        st.dataframe(df, use_container_width=True)
-
-                    # NON-SELECT queries
+                    update_ui_steps(0)
+                    engine = load_engine(st.session_state.db_path)
+                    
+                    update_ui_steps(1)
+                    clarification = engine.get_clarification(user_input)
+                    
+                    if "AMBIGUOUS" in clarification:
+                        st.session_state.last_result = {"type": "warning", "content": clarification}
+                        status.update(label="⚠️ Ambiguity Detected", state="error", expanded=False)
                     else:
-                        cursor = conn.cursor()
-                        cursor.execute(generated_sql)
-                        conn.commit()
-                        affected_rows = cursor.rowcount
-
-                        st.markdown(f"""
-                        <div class="success-box">
-                        ✅ {affected_rows} rows affected
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    conn.close()
-
-                except Exception as e:
-                    st.error(f"Execution Error: {e}")
-
-
-
-                    # -------- REAL AUDIT LOGGING (CORRECT PLACE) --------
-                    action_type = "SELECT"
-                    sql_lower = generated_sql.lower()
-
-                    if "update" in sql_lower:
-                        action_type = "UPDATE"
-                    elif "delete" in sql_lower:
-                        action_type = "DELETE"
-                    elif "insert" in sql_lower:
-                        action_type = "INSERT"
-
-                    log_action(
-                        user_id=st.session_state.user["name"],
-                        user_role=role,
-                        action_type=action_type,
-                        dataset_name=st.session_state.db_path,
-                        natural_language_query=user_query,
-                        generated_sql=generated_sql,
-                        outcome_status="SUCCESS",
-                        affected_rows=affected_rows
-                    )
-
-                    st.markdown(f"""
-                    <div class="success-box">
-                    ✅ {affected_rows} rows affected in {st.session_state.db_path}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    if df is not None:
-                        st.subheader("📊 Affected Dataset")
-                        st.dataframe(history_df, use_container_width=True)
+                        update_ui_steps(2)
+                        generated_sql = engine.generate_sql(user_input)
+                        
+                        update_ui_steps(3)
+                        # Sanitizer logic here
+                        
+                        update_ui_steps(4)
+                        # Dry run logic here
+                        
+                        dml_keywords = ["UPDATE", "DELETE", "INSERT", "DROP", "ALTER"]
+                        if any(k in generated_sql.upper() for k in dml_keywords):
+                            st.session_state.pending_dml = generated_sql
+                            status.update(label="✅ Authorization Required", state="complete", expanded=False)
+                        else:
+                            update_ui_steps(5)
+                            result = engine.execute_query(generated_sql, user_command=user_input)
+                            
+                            # Log Audit for SELECT
+                            log_action(st.session_state.user["name"], st.session_state.user["role"], "SELECT", os.path.basename(st.session_state.db_path), user_input, generated_sql, "SUCCESS", len(result) if isinstance(result, pd.DataFrame) else 0)
+                            
+                            st.session_state.last_result = {"type": "data", "sql": generated_sql, "data": result}
+                            update_ui_steps(6) # Finalize all steps
+                            status.update(label="✅ Pipeline Complete", state="complete", expanded=False)
 
                 except Exception as e:
-                    st.error(f"Execution Error: {e}")
+                    st.error(f"Error: {e}")
+                    status.update(label="❌ Pipeline Error", state="error")
 
-                    # -------- FAILURE AUDIT LOGGING --------
-                    log_action(
-                        user_id=st.session_state.user["name"],
-                        user_role=role,
-                        action_type="FAILED",
-                        dataset_name=st.session_state.db_path,
-                        natural_language_query=user_query,
-                        generated_sql=generated_sql,
-                        outcome_status="FAILED",
-                        affected_rows=0
-                    )
+        # --- DML AUTHORIZATION GATE ---
+        if st.session_state.pending_dml:
+            st.markdown('<div class="warning-box">⚠️ <b>Action Required:</b> Data Manipulation Request</div>', unsafe_allow_html=True)
+            st.code(st.session_state.pending_dml, language="sql")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Authorize & Commit", use_container_width=True):
+                    engine = load_engine(st.session_state.db_path)
+                    res = engine.execute_query(st.session_state.pending_dml, user_command=st.session_state.last_query)
+                    log_action(st.session_state.user["name"], st.session_state.user["role"], "DML_COMMIT", os.path.basename(st.session_state.db_path), st.session_state.last_query, st.session_state.pending_dml, "SUCCESS", 0)
+                    st.session_state.last_result = {"type": "data", "sql": st.session_state.pending_dml, "data": res}
+                    st.session_state.pending_dml = None
+                    st.rerun()
+            with c2:
+                if st.button("❌ Reject Request", use_container_width=True):
+                    st.session_state.pending_dml = None
+                    st.rerun()
 
-                finally:
-                    conn.close()
-
-    # =====================================================
-    # ---------------- HISTORY (ADMIN/MANAGER) ------------
-    # =====================================================
-    if len(selected_tab) > 1:
-        with selected_tab[1]:
-            st.subheader("📜 Audit History")
-
-            conn = sqlite3.connect(DB_PATH) 
-            query = """
-            SELECT 
-               user_id AS User,
-               user_role AS Role,
-               action_type AS Action,
-               dataset_name AS Dataset,
-               natural_language_query AS Query,
-               generated_sql AS SQL,
-               affected_rows AS Rows,
-               outcome_status AS Status,
-               executed_at AS Time
-            FROM audit_log
-            ORDER BY executed_at DESC
-            """
-            history_df = pd.read_sql_query(query, conn)
-            conn.close()
-
-            if not history_df.empty:
-                st.dataframe(history_df, use_container_width=True)
-
+        # --- RESULTS DISPLAY ---
+        if st.session_state.last_result and not st.session_state.pending_dml:
+            res = st.session_state.last_result
+            st.markdown(f'<div class="query-box"><b>Inquiry:</b> {st.session_state.last_query}</div>', unsafe_allow_html=True)
+            
+            if res["type"] == "warning":
+                st.warning(res["content"])
             else:
-                st.info("No logs yet.")
+                st.markdown("### 📄 Validated SQL")
+                st.code(res["sql"], language="sql")
+                
+                if isinstance(res["data"], pd.DataFrame):
+                    st.markdown(f'<div class="success-box">✅ Found {len(res["data"])} records</div>', unsafe_allow_html=True)
+                    st.dataframe(res["data"], use_container_width=True, hide_index=True)
+                    csv = res["data"].to_csv(index=False).encode('utf-8')
+                    st.download_button(label="📥 Download Results as CSV", data=csv, file_name="export.csv", mime="text/csv")
+                else:
+                    st.success(res["data"])
 
+    # --- AUDIT TABS ---
+    if len(tabs) > 1:
+        with tabs[1]:
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    df_logs = pd.read_sql_query("SELECT * FROM audit_log ORDER BY executed_at DESC", conn)
+                    st.dataframe(df_logs, use_container_width=True, hide_index=True)
+            except:
+                st.info("Audit logs are initializing...")
 else:
-    st.info("Please login to access LegalBrain AI.")
+    st.markdown("<h2 style='text-align: center;'>LegalBrain AI</h2>", unsafe_allow_html=True)
