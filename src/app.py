@@ -10,6 +10,7 @@ from nlp_engine import NLPEngine
 from database.audit_schema import create_audit_table
 from services.audit_logger import log_action
 from database.db_config import DB_PATH
+from rbac_manager import is_authorized
 
 # Initialize Audit Database on startup
 create_audit_table()
@@ -65,6 +66,7 @@ with st.sidebar:
             if emp_id in EMPLOYEES:
                 st.session_state.logged_in = True
                 st.session_state.user = EMPLOYEES[emp_id]
+                st.session_state.user['emp_id'] = emp_id
                 st.rerun()
             else:
                 st.error("Invalid ID")
@@ -162,21 +164,33 @@ if st.session_state.logged_in:
                         
                         update_ui_steps(4)
                         # Dry run logic here
+                        # 🔐 NEW: RBAC SECURITY GATE
+                        # Check if the user is allowed to run this specific SQL
+                        if not is_authorized(st.session_state.user['emp_id'], generated_sql):
+                            st.session_state.last_result = {
+                                "type": "error", 
+                                "content": f"❌ RBAC BLOCKED: {st.session_state.user['role']} role does not have permission for this operation."
+                            }
+                            status.update(label="🚫 Access Denied", state="error", expanded=False)
                         
-                        dml_keywords = ["UPDATE", "DELETE", "INSERT", "DROP", "ALTER"]
-                        if any(k in generated_sql.upper() for k in dml_keywords):
-                            st.session_state.pending_dml = generated_sql
-                            status.update(label="✅ Authorization Required", state="complete", expanded=False)
                         else:
-                            update_ui_steps(5)
-                            result = engine.execute_query(generated_sql, user_command=user_input)
-                            
-                            # Log Audit for SELECT
-                            log_action(st.session_state.user["name"], st.session_state.user["role"], "SELECT", os.path.basename(st.session_state.db_path), user_input, generated_sql, "SUCCESS", len(result) if isinstance(result, pd.DataFrame) else 0)
-                            
-                            st.session_state.last_result = {"type": "data", "sql": generated_sql, "data": result}
-                            update_ui_steps(6) # Finalize all steps
-                            status.update(label="✅ Pipeline Complete", state="complete", expanded=False)
+                            # If authorized, proceed to check if it's a "DANGER" query (DML)
+                            dml_keywords = ["UPDATE", "DELETE", "INSERT", "DROP", "ALTER"]
+                            import re
+
+                            if any(re.search(rf"\b{k}\b", generated_sql, re.IGNORECASE) for k in dml_keywords):
+                                st.session_state.pending_dml = generated_sql
+                                status.update(label="✅ Authorization Required", state="complete", expanded=False)
+                            else:
+                                update_ui_steps(5)
+                                result = engine.execute_query(generated_sql, user_command=user_input)
+                                
+                                # Log Audit for SELECT
+                                log_action(st.session_state.user["name"], st.session_state.user["role"], "SELECT", os.path.basename(st.session_state.db_path), user_input, generated_sql, "SUCCESS", len(result) if isinstance(result, pd.DataFrame) else 0)
+                                
+                                st.session_state.last_result = {"type": "data", "sql": generated_sql, "data": result}
+                                update_ui_steps(6)
+                                status.update(label="✅ Pipeline Complete", state="complete", expanded=False)
 
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -204,11 +218,13 @@ if st.session_state.logged_in:
         # --- RESULTS DISPLAY ---
         if st.session_state.last_result and not st.session_state.pending_dml:
             res = st.session_state.last_result
-            st.markdown(f'<div class="query-box"><b>Inquiry:</b> {st.session_state.last_query}</div>', unsafe_allow_html=True)
             
-            if res["type"] == "warning":
+            if res["type"] == "error":
+                st.error(res["content"])
+            elif res["type"] == "warning":
                 st.warning(res["content"])
             else:
+                st.markdown(f'<div class="query-box"><b>Inquiry:</b> {st.session_state.last_query}</div>', unsafe_allow_html=True)
                 st.markdown("### 📄 Validated SQL")
                 st.code(res["sql"], language="sql")
                 

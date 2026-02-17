@@ -1,4 +1,4 @@
-
+import re
 from pymongo import MongoClient
 
 # Create MongoDB connection (once)
@@ -12,23 +12,63 @@ def get_user_permissions(emp_id):
     Fetch permissions list for given employee ID.
     """
     user = collection.find_one({"emp_id": emp_id})
-    
+
     if user:
         return user.get("permissions", [])
-    
+
     return []
 
 
-def is_authorized(emp_id, sql_query):
+def remove_sql_comments(query):
     """
-    Check if user has permission to execute this SQL query.
+    Remove SQL single-line and multi-line comments.
     """
-    permissions = get_user_permissions(emp_id)
+    # Remove -- comments
+    query = re.sub(r'--.*', '', query)
 
-    if not permissions:
+    # Remove /* */ comments
+    query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+
+    return query
+
+
+def extract_sql_keywords(query):
+    """
+    Extract SQL command keywords as whole words.
+    """
+    # Match SQL keywords as whole words only
+    keywords = re.findall(r'\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b',
+                          query,
+                          flags=re.IGNORECASE)
+    return [k.upper() for k in keywords]
+
+
+def is_authorized(emp_id, sql_query):
+
+    user = collection.find_one({"emp_id": emp_id})
+
+    if not user:
         return False
 
-    # Extract SQL command type
-    query_type = sql_query.strip().split()[0].upper()
+    permissions = user.get("permissions", [])
+    role = user.get("role", "").upper()
 
-    return query_type in permissions
+    # 🔓 Admin Fast-Track
+    if role == "ADMIN":
+        return True
+
+    # Remove comments
+    cleaned_query = remove_sql_comments(sql_query)
+
+    # Extract SQL keywords
+    found_keywords = extract_sql_keywords(cleaned_query)
+
+    if not found_keywords:
+        return False
+
+    # Check all keywords
+    for keyword in found_keywords:
+        if keyword not in permissions:
+            return False
+
+    return True
